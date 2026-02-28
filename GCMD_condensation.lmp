@@ -1,0 +1,132 @@
+'''
+GCMD Simulation of water condensation on base with pore
+The GCMC method controls water molecule insertion/deletion in the vapor phase region
+to maintain constant pressure conditions
+software: Lammps
+Author: Shenghui Zhong, Boxuan Cui (Beihang University)
+'''
+
+variable	seed equal 74581
+variable	Tequ equal 500 # initiale temperature
+variable	Tcold equal 220 # initiale temperature
+variable	Thot equal 500 # initiale temperature
+variable	mu equal -1 # not used
+variable	P equal 5.5 # bars
+variable	disp equal 0.5 # not used
+variable	tfac equal 5.0/3.0 # (3 trans + 2 rot)/(3 trans)
+
+#============= initialization =============#
+units			metal
+dimension		3
+boundary		p p p
+atom_style		full
+neighbor		2.0 bin
+neigh_modify	delay 0 every 1 check yes one 11330 page 200000
+log				log.lammps
+read_data		Porer_R10_water.data
+
+#============= water parameter charge bond angle (OPC)=============#
+set				type 1 charge -1.358200										# charge of O
+set				type 2 charge 0.679100										# charge of H
+
+bond_style		harmonic
+bond_coeff		1  21.7   0.8724
+angle_style		harmonic
+angle_coeff		1  2.17   103.6
+
+#=============  group =============#
+group			vapor  type 1 2												# group of the vapor molecules
+group			base  type 3												# group of the base
+
+region			gcmcregion block -260 260 -260 260 450 510 units box		#GCMC region
+region			gcmcnvt block -260 260 -260 260 30 520 units box			#saturated vapor region
+
+group			gcmcH2Onvt dynamic vapor region gcmcnvt every 100
+group			gcmcH2Opro dynamic vapor region gcmcregion every 100
+
+region			nearbase0 block -260 260 -260 260 -10 30 units box			#NVE region
+
+group			nveparticle dynamic all region nearbase0 every 100
+group			nearbaseH2O dynamic vapor region nearbase0 every 100
+
+
+#=============  Pair coefficients =============#
+pair_style		hybrid lj/cut/tip4p/long 1 2 1 1 0.159400 12.5 12.0 lj/cut 12.0 sw
+pair_modify		tail yes
+kspace_style	pppm/tip4p 1.0e-6 											# Long-range interaction using PPPM
+pair_coeff		1 1 lj/cut/tip4p/long 0.00922777 3.166550 # O-O
+pair_coeff		1 2 lj/cut/tip4p/long 0 0 # O-H
+pair_coeff		2 2 lj/cut/tip4p/long 0 0 # H-H
+pair_coeff		1 3 lj/cut 0.01 3.1903										#mW-O
+pair_coeff		2 3 lj/cut 0 0												#mW-H
+pair_coeff		* * sw ./mw.sw NULL NULL mW
+
+#=============region wall and spring_force =============#
+region 			t_wall block INF INF INF INF INF 520 units box
+fix 			wall1 all wall/region t_wall harmonic 25 0.0 10.0
+fix				spring_force base spring/self 4.3							# Spring force between the soot atoms
+molecule		h2omol OPC.lammps
+fix				SHAKE vapor shake 1e-6 500 0 b 1 a 1 mol h2omol				# Use of SHAKE algorithm for water to be rigid
+
+# ============= compute temperature =============#
+compute			tvapor vapor temp
+compute			tbase base temp
+compute			tgcmcH2Onvt gcmcH2Onvt temp
+compute			tgcmcH2Opro gcmcH2Opro temp
+compute			tnearbaseH2O nearbaseH2O temp
+
+compute_modify	thermo_temp dynamic/dof yes
+compute_modify	tvapor dynamic/dof yes
+compute_modify	tgcmcH2Onvt dynamic/dof yes
+compute_modify	tgcmcH2Opro dynamic/dof yes
+compute_modify	tnearbaseH2O dynamic/dof yes
+
+compute			myPress gcmcH2Opro stress/atom NULL
+compute			reducePress gcmcH2Opro reduce sum c_myPress[1] c_myPress[2] c_myPress[3]
+
+variable		VgcmcH2Opro equal 520*520*60
+variable		trace equal c_reducePress[1]+c_reducePress[2]+c_reducePress[3]
+variable		GCMCpressure equal -v_trace/(3*v_VgcmcH2Opro)				#Compute pressure in GCMC region
+
+timestep		0.001
+
+thermo_style	custom step temp c_tvapor c_tbase c_tgcmcH2Onvt c_tgcmcH2Opro c_tnearbaseH2O press v_GCMCpressure
+thermo			100 ### Output every 100 time steps
+thermo_modify	flush yes ### Make sure output is updated and not buffered if LAMMPS stops before completion
+
+velocity		vapor create ${Tequ} ${seed} rot yes dist gaussian
+velocity		base create ${Tequ} ${seed} rot yes dist gaussian
+
+
+fix				equ1 vapor nvt temp ${Tequ} ${Tequ} $(dt*100)
+fix				equ2 base nvt temp ${Tequ} ${Tequ} $(dt*100)
+
+dump			1 all custom 1000 dump.equal id mol type x y z vx vy vz
+
+run				20000
+unfix			equ1
+unfix			equ2 
+undump			1
+write_restart	restart.equal
+
+# ============= NVE procedure =============
+timestep		0.001
+fix				2 gcmcH2Onvt nvt temp ${Thot} ${Thot} $(dt*100)
+fix_modify		2 temp tgcmcH2Onvt # important for subgroup thermalisation
+
+fix				3 nveparticle nve
+fix				run2 base langevin ${Tcold} ${Tcold} $(dt*100) ${seed}
+
+fix				mygcmc vapor gcmc 500 100 0 0 ${seed} ${Thot} ${mu} ${disp} mol h2omol &
+				tfac_insert ${tfac} shake SHAKE region gcmcregion pressure ${P} full_energy group vapor
+				#GCMC method
+
+
+#### Output trajectory files ####
+dump			2 all custom 1000 dump.atom id mol type x y z vx vy vz
+dump_modify		2 append yes
+
+
+restart			1000 restart.lmp restart2.lmp
+run				1000000 upto # 10 ns
+write_data		data.final
